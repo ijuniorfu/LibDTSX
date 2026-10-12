@@ -1,0 +1,32 @@
+[package]
+name = "dtsx-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "C-callable DTS:X decoder for Apple platforms: lossless bed, heights and objects with their positions, built on the dca crate"
+publish = false
+rust-version = "1.89"
+
+[lib]
+name = "dtsx"
+# staticlib is what the xcframework ships; rlib lets the Rust tests and examples link it.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# harletty-bridge workspace, `dca` library crate only. Pinned to an exact commit so a rebuild
+# decodes exactly what was verified (the same commit SpatialAudioBridge renders with); bump
+# deliberately and re-run the harness.
+dca = { git = "https://github.com/harletty/harletty-bridge", rev = "a717bae441b116485f0254603dc20a6ede65d8c6" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+# Unwinding stays on: every exported function catches panics at the FFI boundary.
+panic = "unwind"
+incremental = false
+
+[profile.dev]
+# The lossless decoder is too slow unoptimised to run the sample tests in reasonable time.
+opt-level = 2

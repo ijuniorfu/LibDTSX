@@ -1,0 +1,17 @@
+[toolchain]
+# Pinned so a rebuild reproduces the verified artifact. Every Apple target used here ships a
+# prebuilt std on stable (aarch64-apple-tvos/-sim and visionOS are tier 2 since Rust 1.87),
+# so neither nightly nor -Zbuild-std is needed.
+channel = "1.99.0"
+profile = "minimal"
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-apple-tvos",
+    "aarch64-apple-tvos-sim",
+    "aarch64-apple-visionos",
+    "aarch64-apple-visionos-sim",
+]

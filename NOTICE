@@ -1,0 +1,23 @@
+LibDTSX (dtsx-ffi)
+C API and Apple packaging of a DTS:X decoder.
+Copyright 2026 kristofferR (https://github.com/kristofferR), licensed under the Apache License,
+Version 2.0.
+
+This product includes the `dca` crate 0.8.0 from the harletty-bridge project
+(https://github.com/harletty/harletty-bridge), the DTS Coherent Acoustics, DTS-HD Master Audio
+and DTS:X decoder, licensed under the Apache License, Version 2.0. It is built from commit
+a717bae441b116485f0254603dc20a6ede65d8c6, unmodified.
+
+The DTS:X reconstruction in src/engine.rs (fold removal before the bed and the extension feeds
+are rendered side by side, and the refusal of folds that cannot be resolved) follows
+SpatialAudioBridge (https://github.com/kristofferR/SpatialAudioBridge), licensed under the Apache
+License, Version 2.0, whose 7.1.4 render harness/verify.sh compares against.
+
+The static library also contains, compiled in, the Rust standard library and these crates,
+each available under the MIT license or the Apache License, Version 2.0: log, num-complex,
+num-integer, num-traits, primal-check, rustfft, strength_reduce, thiserror, transpose.
+
+All of it is under the Apache License, Version 2.0, whose text is in LICENSE.
+
+DTS, DTS-HD, DTS-HD Master Audio and DTS:X are trademarks of DTS, Inc. or its affiliates. IMAX is
+a trademark of IMAX Corporation. This software is not affiliated with or endorsed by either.

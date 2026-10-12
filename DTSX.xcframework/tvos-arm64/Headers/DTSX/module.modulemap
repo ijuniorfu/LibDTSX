@@ -1,0 +1,4 @@
+module DTSX {
+    header "dtsx.h"
+    export *
+}

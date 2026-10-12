@@ -1,0 +1,6 @@
+/target/
+/.swiftpm/
+/.build/
+.DS_Store
+# The shipped static libraries, whatever a global *.a rule says.
+!/DTSX.xcframework/*/libdtsx.a
