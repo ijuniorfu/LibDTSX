@@ -340,6 +340,12 @@ static DTSXStatus decode(DTSXDecoder *d, const Input *in, size_t from, size_t ch
             sum->channels = b.channel_count;
             sum->rate = b.sample_rate;
             if (sum->window_count) keep(sum, &b);
+            if (sum->resumed_from)
+                /* A resumed decode keeps the source's time: frames without output (pending in the
+                   lossless layer, priming) count too, so the offset is the frame's position. */
+                CHECK(b.input_frame_offset == b.input_access_unit * b.access_unit_frames,
+                      "resumed block at input frame %" PRIu64 " for access unit %" PRIu64, b.input_frame_offset,
+                      b.input_access_unit);
             if (sum->resumed_from) {
                 float diff = block_difference(sum->resumed_from, &b, sum->resumed_from->start + b.input_access_unit);
                 if (diff > 0 && getenv("HARNESS_VERBOSE")) {

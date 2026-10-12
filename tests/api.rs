@@ -344,3 +344,48 @@ fn chunking_does_not_change_the_output() {
     assert_eq!(digest(317), whole);
     assert_eq!(digest(1), whole);
 }
+
+#[test]
+fn a_pending_frame_on_entry_counts_on_the_timeline() {
+    let Some(data) = sample() else { return };
+    let offsets = frame_offsets(&data);
+    // Entered at frame 4451 the lossless layer still buffers (peak bit rate smoothing) and the
+    // first frame comes back pending: no output of its own, but 512 frames of the source.
+    let (entry, end) = (4451, 4471);
+    let continuous = Decoder::new();
+    let mut reference = std::collections::HashMap::new();
+    for piece in data[..offsets[end]].chunks(65_536) {
+        assert_eq!(continuous.push(piece), OK);
+        while let (OK, b) = continuous.pull() {
+            if b.input_access_unit >= entry as u64 {
+                let plane =
+                    unsafe { std::slice::from_raw_parts(*b.channels, b.frame_count as usize) };
+                reference.insert(b.input_frame_offset - entry as u64 * 512, plane.to_vec());
+            }
+        }
+    }
+    let d = Decoder::new();
+    let mut first = None;
+    let mut matching = 0;
+    for piece in data[offsets[entry]..offsets[end]].chunks(4096) {
+        assert_eq!(d.push(piece), OK);
+        while let (OK, b) = d.pull() {
+            first.get_or_insert(b.input_frame_offset);
+            // The offset is the source position: the same frames as the continuous decode's there.
+            assert_eq!(b.input_frame_offset, b.input_access_unit * 512);
+            let plane = unsafe { std::slice::from_raw_parts(*b.channels, b.frame_count as usize) };
+            if reference.get(&b.input_frame_offset) == Some(&plane.to_vec()) {
+                matching += 1;
+            }
+        }
+    }
+    let stats = d.stats();
+    // The pending frame, then the two priming frames.
+    assert_eq!(stats.access_units_skipped, 3);
+    assert_eq!(first, Some(3 * 512));
+    // Converged to the continuous decode, placed at the same source position.
+    assert!(
+        matching >= 10,
+        "{matching} of 17 blocks match the continuous decode"
+    );
+}
