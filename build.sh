@@ -81,6 +81,7 @@ mkdir -p "$STAGE_DIR/headers/DTSX"
 cp include/dtsx.h include/module.modulemap "$STAGE_DIR/headers/DTSX/"
 printf '%s\n' '_dtsx_*' '_rust_eh_personality' >"$STAGE_DIR/exported_symbols"
 
+# Kept in step with LibTrueHD's copy: a change here goes into both repositories.
 # weaken <object> <symbol>: sets N_WEAK_DEF on the one external definition of <symbol> in a thin
 # 64-bit Mach-O object. Neither ld -r nor strip can do this, and Xcode ships no objcopy.
 weaken() {

@@ -171,6 +171,7 @@ arch -x86_64 "$OUT/link-macos-arm64_x86_64" 2>/dev/null && echo "  macOS x86_64 
     echo "  (macOS x86_64 slice not run: Rosetta unavailable or failed)"
 
 # ---- next to a second Rust library, in a host with Objective-C and C++ ---------------------
+# Kept in step with LibTrueHD's copy: a change here goes into both repositories.
 # Compact unwind encodes at most three personality routines per image. A second Rust static
 # library brings its own rust_eh_personality and the host brings __objc_personality_v0 and
 # __gxx_personality_v0, so this links only if ours coalesces with the other Rust copy
