@@ -79,7 +79,7 @@ if [ "${#present[@]}" -gt 0 ]; then
         (cd "$ROOT/SpatialAudioBridge/Rust/SpatialAudioCore" &&
             CARGO_TARGET_DIR="$ROOT/SpatialAudioBridge/target" cargo build --release --locked --example render)
     fi
-    for entry in "${present[@]}"; do
+    for entry in ${present[@]+"${present[@]}"}; do
         read -r name _ <<<"$entry"
         [ -s "$REF/${name%.dts}.f32" ] || "$SAB_RENDER" dtsx "$SAMPLES/$name" "$REF/${name%.dts}.f32" 7.1.4 >/dev/null
     done
@@ -117,7 +117,7 @@ same_as_reference() {
         failures=$((failures + 1))
     fi
 }
-for entry in "${present[@]}"; do
+for entry in ${present[@]+"${present[@]}"}; do
     read -r name presentation <<<"$entry"
     base="${name%.dts}"
     run "$base, 4096-byte chunks, render + seeks" \
@@ -170,6 +170,61 @@ done
 arch -x86_64 "$OUT/link-macos-arm64_x86_64" 2>/dev/null && echo "  macOS x86_64 slice runs under Rosetta: selftest OK" ||
     echo "  (macOS x86_64 slice not run: Rosetta unavailable or failed)"
 
+# ---- next to a second Rust library, in a host with Objective-C and C++ ---------------------
+# Compact unwind encodes at most three personality routines per image. A second Rust static
+# library brings its own rust_eh_personality and the host brings __objc_personality_v0 and
+# __gxx_personality_v0, so this links only if ours coalesces with the other Rust copy
+# (AetherEngine#752). Both link orders, and the panic selftest must still pass in the result.
+echo
+echo "======== next to a second Rust library, Objective-C and C++"
+cat >"$OUT/other_rust.rs" <<'EOF'
+#[unsafe(no_mangle)]
+pub extern "C" fn other_rust_catches() -> i32 {
+    std::panic::catch_unwind(|| panic!("other_rust: deliberate panic, caught")).is_err() as i32
+}
+EOF
+cat >"$OUT/host_objc.m" <<'EOF'
+#import <Foundation/Foundation.h>
+#include "dtsx.h"
+int host_cxx_catches(void);
+int other_rust_catches(void);
+int main(void) {
+    int objc = 0;
+    @try { @throw [NSException exceptionWithName:@"host" reason:@"caught" userInfo:nil]; }
+    @catch (NSException *e) { objc = 1; }
+    return objc && host_cxx_catches() && other_rust_catches() && dtsx_selftest() == 0 ? 0 : 1;
+}
+EOF
+cat >"$OUT/host_cxx.cpp" <<'EOF'
+#include <stdexcept>
+extern "C" int host_cxx_catches(void) {
+    try { throw std::runtime_error("host"); } catch (const std::exception &) { return 1; }
+}
+EOF
+if (cd "$CRATE" && rustc --edition 2024 -O --crate-type staticlib --target aarch64-apple-darwin \
+        "$OUT/other_rust.rs" -o "$OUT/libother_rust.a") 2>"$OUT/coexist.log" &&
+    xcrun clang -c -mmacosx-version-min=15.0 -fobjc-exceptions -I"$MAC/Headers/DTSX" \
+        "$OUT/host_objc.m" -o "$OUT/host_objc.o" 2>>"$OUT/coexist.log" &&
+    xcrun clang++ -c -mmacosx-version-min=15.0 "$OUT/host_cxx.cpp" -o "$OUT/host_cxx.o" 2>>"$OUT/coexist.log"; then
+    for order in other-first dtsx-first; do
+        if [ "$order" = other-first ]; then libs=("$OUT/libother_rust.a" "$MAC/libdtsx.a")
+        else libs=("$MAC/libdtsx.a" "$OUT/libother_rust.a"); fi
+        if xcrun clang++ -mmacosx-version-min=15.0 "$OUT/host_objc.o" "$OUT/host_cxx.o" "${libs[@]}" \
+                -framework Foundation -o "$OUT/coexist-$order" 2>>"$OUT/coexist.log" &&
+            "$OUT/coexist-$order" 2>/dev/null; then
+            echo "  $order: links with one Rust personality, all four catch"
+        else
+            echo "  $order: FAILED"
+            cat "$OUT/coexist.log"
+            failures=$((failures + 1))
+        fi
+    done
+else
+    echo "  COEXISTENCE CHECK COULD NOT BUILD ITS HOST"
+    cat "$OUT/coexist.log"
+    failures=$((failures + 1))
+fi
+
 echo
 echo "======== Swift through the module map"
 cat >"$OUT/swift_check.swift" <<'EOF'
@@ -212,7 +267,7 @@ print("Swift: \(blocks) blocks, \(name), \(info.channel_count) ch (\(objects) ob
 exit(blocks > 0 && status == DTSX_NEED_MORE_DATA ? 0 : 1)
 EOF
 swift_sample=""
-for entry in "${present[@]}"; do read -r name _ <<<"$entry"; swift_sample="$SAMPLES/$name"; done
+for entry in ${present[@]+"${present[@]}"}; do read -r name _ <<<"$entry"; swift_sample="$SAMPLES/$name"; done
 if xcrun swiftc -O -I "$MAC/Headers/DTSX" "$OUT/swift_check.swift" "$MAC/libdtsx.a" \
     -o "$OUT/swift_check" 2>"$OUT/swift.log" &&
     "$OUT/swift_check" "$SAMPLES/fate-master-audio-7.1.dts" refused 2>/dev/null &&

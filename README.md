@@ -95,8 +95,9 @@ here (`DTSXStreamInfo.experimental`).
 
 Requires Xcode and rustup. The toolchain and targets are pinned in `rust-toolchain.toml` (stable
 Rust; every Apple target used here ships a prebuilt std). The script builds each slice with fat
-LTO, prelinks it so only the `dtsx_*` functions are global (so it links next to other Rust static
-libraries such as LibTrueHD and LibDovi), and assembles the xcframework. Source paths are remapped
+LTO, prelinks it so only the `dtsx_*` functions and a weak `rust_eh_personality` are global (so it
+links next to other Rust static libraries such as LibTrueHD and LibDovi, and shares their
+personality routine: compact unwind encodes at most three per image), and assembles the xcframework. Source paths are remapped
 so the binaries carry no build-machine paths. Minimum OS: iOS 18, tvOS 18, macOS 15, visionOS 1.
 
 ## Verify

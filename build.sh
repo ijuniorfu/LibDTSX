@@ -37,6 +37,7 @@ for dir in /opt/homebrew/opt/rustup/bin "$HOME/.cargo/bin"; do
 done
 export PATH
 command -v rustup >/dev/null || { echo "ERROR: rustup not found (https://rustup.rs)" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "ERROR: python3 not found" >&2; exit 1; }
 command -v xcodebuild >/dev/null || { echo "ERROR: Xcode command line tools not found" >&2; exit 1; }
 
 # Minimum OS versions of the consumer (AetherEngine). rustc reads these for Apple targets and
@@ -78,14 +79,51 @@ rm -rf "$STAGE_DIR"
 # xcframework that does the same (LibTrueHD and LibDovi do).
 mkdir -p "$STAGE_DIR/headers/DTSX"
 cp include/dtsx.h include/module.modulemap "$STAGE_DIR/headers/DTSX/"
-echo '_dtsx_*' >"$STAGE_DIR/exported_symbols"
+printf '%s\n' '_dtsx_*' '_rust_eh_personality' >"$STAGE_DIR/exported_symbols"
+
+# weaken <object> <symbol>: sets N_WEAK_DEF on the one external definition of <symbol> in a thin
+# 64-bit Mach-O object. Neither ld -r nor strip can do this, and Xcode ships no objcopy.
+weaken() {
+    python3 - "$1" "$2" <<'PY'
+import struct, sys
+path, name = sys.argv[1], sys.argv[2].encode()
+b = bytearray(open(path, "rb").read())
+magic, ncmds = struct.unpack_from("<I", b, 0)[0], struct.unpack_from("<I", b, 16)[0]
+assert magic == 0xFEEDFACF, f"{path}: not a thin 64-bit Mach-O"
+off, hits = 32, 0
+for _ in range(ncmds):
+    cmd, size = struct.unpack_from("<II", b, off)
+    if cmd == 0x2:  # LC_SYMTAB
+        symoff, nsyms, stroff, _ = struct.unpack_from("<IIII", b, off + 8)
+        for i in range(nsyms):
+            entry = symoff + 16 * i
+            strx, ntype, _, desc = struct.unpack_from("<IBBH", b, entry)
+            if b[stroff + strx:].split(b"\0", 1)[0] != name:
+                continue
+            assert ntype & 0x01 and ntype & 0x0E == 0x0E, f"{name.decode()}: not an external definition"
+            struct.pack_into("<H", b, entry + 6, desc | 0x0080)  # N_WEAK_DEF
+            hits += 1
+    off += size
+assert hits == 1, f"{path}: {hits} definitions of {name.decode()}"
+open(path, "wb").write(b)
+PY
+}
 
 # prelink <target> <arch> <ld platform> <min OS> <sdk>: prints the path of a static library
-# holding one relocatable object in which only the C API (_dtsx_*) is global. Even
-# after LTO, a Rust staticlib exports rust_eh_personality and a few std symbols unmangled or
-# with toolchain-wide hashes; a second Rust static library in the same app (LibTrueHD and LibDovi
-# both ship one) then fails to link with duplicate symbols. `ld -r` with an exported
-# symbol list turns every other global, compiler-builtins included, into a local symbol.
+# holding one relocatable object in which only the C API (_dtsx_*) and a weak
+# rust_eh_personality are global. Even after LTO, a Rust staticlib exports rust_eh_personality
+# and a few std symbols unmangled or with toolchain-wide hashes; a second Rust static library in
+# the same app (LibTrueHD and LibDovi both ship one) then fails to link with duplicate symbols.
+# `ld -r` with an exported symbol list turns every other global, compiler-builtins included,
+# into a local symbol.
+#
+# The personality is the exception. A local copy is a second personality routine in the image,
+# and compact unwind encodes at most three per image: two Rust copies plus a host's own
+# __objc_personality_v0 and __gxx_personality_v0 fail the link with "Too many personality
+# routines" (AetherEngine#752). Exported weak, it coalesces with another Rust library's copy (the
+# strong one wins, or the first weak one) and every Rust frame in the app shares one routine;
+# alone, this copy serves. Only the routine is shared, panics stay inside this library: every
+# exported function catches them, and `dtsx_selftest` checks that in the final link.
 prelink() {
     local target="$1" arch="$2" platform="$3" minos="$4" sdk="$5"
     local work="$BUILD_DIR/prelink/$target" lib="$CARGO_DIR/$target/release/$LIB"
@@ -102,6 +140,7 @@ prelink() {
         -o "$work/DTSX.o" "$work"/objs/*.o 2> >(grep -v 'built for newer' >&2)
     # -S drops debug sections only; the exported entry points keep their names.
     strip -S "$work/DTSX.o"
+    weaken "$work/DTSX.o" _rust_eh_personality
     libtool -static -o "$work/$LIB" "$work/DTSX.o" 2>/dev/null
     echo "$work/$LIB"
 }
@@ -149,3 +188,20 @@ for dir in "$XCFW_OUT"/*/; do
 done
 echo "==> Global symbols (every slice exports exactly these):"
 nm -gU "$XCFW_OUT/tvos-arm64/$LIB" | awk 'NF == 3 {print "  " $3}'
+for dir in "$XCFW_OUT"/*/; do
+    lib="$dir$LIB"
+    [ -f "$lib" ] || continue
+    printf '  %-28s %6s  %s\n' "$(basename "$dir")" "$(du -h "$lib" | cut -f1)" \
+        "$(lipo -archs "$lib")"
+done
+echo "==> Global symbols (every slice exports exactly these):"
+nm -gU "$XCFW_OUT/tvos-arm64/$LIB" | awk 'NF == 3 {print "  " $3}'
+for dir in "$XCFW_OUT"/*/; do
+    for arch in $(lipo -archs "$dir$LIB"); do
+        syms="$(nm -m -arch "$arch" "$dir$LIB")"
+        grep -Eq 'weak external (\[no dead strip\] )?_rust_eh_personality$' <<<"$syms" || {
+            echo "ERROR: $(basename "$dir") $arch: rust_eh_personality is not a weak definition" >&2
+            exit 1
+        }
+    done
+done
