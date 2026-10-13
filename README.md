@@ -20,7 +20,7 @@ conversion of DTS:X object angles into room coordinates, and the Apple packaging
 ## Use
 
 ```swift
-.package(url: "https://github.com/kristofferR/LibDTSX", .upToNextMinor(from: "1.0.0")),
+.package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMinor(from: "1.0.1")),
 // target dependency:
 .product(name: "DTSX", package: "LibDTSX"),
 ```
