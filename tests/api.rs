@@ -274,6 +274,30 @@ fn damage_between_frames_is_skipped_with_an_estimated_timeline() {
 }
 
 #[test]
+fn repeated_gaps_do_not_add_time_to_the_timeline() {
+    let Some(data) = sample() else { return };
+    let offsets = frame_offsets(&data);
+    // One frame repeated, so every gap holds an exact number of frames: 50 at 100..150 and at
+    // 250..300. The second estimate must not count the first gap's frames as framed bytes.
+    let size = offsets[1];
+    let mut stream = data[..size].repeat(500);
+    for (start, end) in [(100, 150), (250, 300)] {
+        stream[start * size..end * size].fill(0xA5);
+    }
+    let d = Decoder::new();
+    let (status, blocks) = d.decode(&stream, 4096);
+    assert_eq!(status, OK);
+    let resumed: Vec<u64> = blocks
+        .iter()
+        .filter(|b| b.0 & BLOCK_DISCONTINUITY != 0)
+        .map(|b| b.1 / 512)
+        .collect();
+    assert_eq!(resumed, [2, 152, 302]);
+    let (_, offset, count) = *blocks.last().unwrap();
+    assert_eq!(offset + u64::from(count), 500 * 512);
+}
+
+#[test]
 fn a_frame_whose_extension_is_damaged_plays_its_bed_as_authored() {
     let Some(data) = sample() else { return };
     let offsets = frame_offsets(&data);

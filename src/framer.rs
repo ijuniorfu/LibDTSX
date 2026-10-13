@@ -50,6 +50,8 @@ pub struct Framer {
     consumed: u64,
     pushed: u64,
     frames: u64,
+    /// Frames actually framed since reset; `frames` also counts the estimates for damage.
+    framed: u64,
     framed_bytes: u64,
     skipped: u64,
     /// Bytes skipped since create() before the first frame was found (survives reset).
@@ -70,6 +72,7 @@ impl Framer {
         self.consumed = 0;
         self.pushed = 0;
         self.frames = 0;
+        self.framed = 0;
         self.framed_bytes = 0;
         self.skipped = 0;
         self.estimated = false;
@@ -215,9 +218,9 @@ impl Framer {
     fn take(&mut self, len: usize, core_samples: u32) -> AuInfo {
         let mut estimated_before = 0;
         let skipped_before = std::mem::take(&mut self.skipped);
-        if skipped_before > 0 && self.frames > 0 {
+        if skipped_before > 0 && self.framed > 0 {
             // Damage between frames: estimate the frames it held from the average frame size.
-            let average = self.framed_bytes as f64 / self.frames as f64;
+            let average = self.framed_bytes as f64 / self.framed as f64;
             estimated_before = (skipped_before as f64 / average).round() as u64;
             self.estimated |= estimated_before > 0;
         }
@@ -230,6 +233,7 @@ impl Framer {
             skipped_before,
         };
         self.frames += 1;
+        self.framed += 1;
         self.framed_bytes += len as u64;
         self.start += len;
         self.consumed += len as u64;
