@@ -373,9 +373,19 @@ fn chunking_does_not_change_the_output() {
 fn a_pending_frame_on_entry_counts_on_the_timeline() {
     let Some(data) = sample() else { return };
     let offsets = frame_offsets(&data);
-    // Entered at frame 4451 the lossless layer still buffers (peak bit rate smoothing) and the
-    // first frame comes back pending: no output of its own, but 512 frames of the source.
-    let (entry, end) = (4451, 4471);
+    // Entered at some frames the lossless layer still buffers (peak bit rate smoothing) and the
+    // first frame comes back pending: no output of its own, but 512 frames of the source. Which
+    // frames those are depends on the encode, so the first one is searched for.
+    let pending_on_entry = |entry: usize| {
+        let d = Decoder::new();
+        let (status, _) = d.decode(&data[offsets[entry]..offsets[entry + 3]], 65_536);
+        status == OK && d.stats().access_units_skipped == 3
+    };
+    let Some(entry) = (0..offsets.len() - 21).find(|&e| pending_on_entry(e)) else {
+        eprintln!("skipped: no frame of this sample is pending on entry");
+        return;
+    };
+    let end = entry + 20;
     let continuous = Decoder::new();
     let mut reference = std::collections::HashMap::new();
     for piece in data[..offsets[end]].chunks(65_536) {
