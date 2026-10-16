@@ -19,8 +19,9 @@
 #    differently in C and Rust; the same with 4096-byte and with random chunks; seeks at 25, 50 and 75% must
 #    restart the input timeline and converge on the continuous decode; the plain stream must be
 #    refused on its first frame, and stay refused.
-# 4. Links a small C program against every other slice, and compiles and runs a Swift program
-#    through the module map (`import DTSX`).
+# 4. Links a small C program against every other slice, links the macOS framework into a host that
+#    also carries a second Rust library, Objective-C and C++, and compiles and runs a Swift program
+#    through the framework module (`import DTSX`).
 # Requires Xcode, rustup and curl.
 
 set -euo pipefail
@@ -87,9 +88,11 @@ fi
 
 # ---- harness against the macOS slice ------------------------------------------------------
 MAC="$XCFW/macos-arm64_x86_64"
+# link_flags <slice>: compile and link against that slice's framework, found at run time by rpath.
+link_flags() { echo "-I$XCFW/$1/DTSX.framework/Headers -F$XCFW/$1 -framework DTSX -Wl,-rpath,$XCFW/$1"; }
 # -ffp-contract=off: the reference render rounds every product and sum separately.
 clang -std=c11 -O2 -ffp-contract=off -Wall -Wextra -mmacosx-version-min=15.0 \
-    -I"$MAC/Headers/DTSX" -o "$OUT/harness" "$HERE/harness.c" "$MAC/libdtsx.a"
+    -o "$OUT/harness" "$HERE/harness.c" $(link_flags macos-arm64_x86_64)
 H="$OUT/harness"
 
 failures=0
@@ -158,8 +161,8 @@ for spec in "ios-arm64 arm64-apple-ios18.0 iphoneos" \
     "xros-arm64-simulator arm64-apple-xros1.0-simulator xrsimulator" \
     "macos-arm64_x86_64 x86_64-apple-macos15.0 macosx"; do
     read -r slice triple sdk <<<"$spec"
-    if xcrun --sdk "$sdk" clang -target "$triple" -I"$XCFW/$slice/Headers/DTSX" "$OUT/link.c" \
-        "$XCFW/$slice/libdtsx.a" -o "$OUT/link-$slice" 2>"$OUT/link-$slice.log"; then
+    if xcrun --sdk "$sdk" clang -target "$triple" "$OUT/link.c" $(link_flags "$slice") \
+        -o "$OUT/link-$slice" 2>"$OUT/link-$slice.log"; then
         echo "  $slice ($triple): links"
     else
         echo "  $slice ($triple): LINK FAILED"
@@ -171,11 +174,10 @@ arch -x86_64 "$OUT/link-macos-arm64_x86_64" 2>/dev/null && echo "  macOS x86_64 
     echo "  (macOS x86_64 slice not run: Rosetta unavailable or failed)"
 
 # ---- next to a second Rust library, in a host with Objective-C and C++ ---------------------
-# Kept in step with LibTrueHD's copy: a change here goes into both repositories.
-# Compact unwind encodes at most three personality routines per image. A second Rust static
-# library brings its own rust_eh_personality and the host brings __objc_personality_v0 and
-# __gxx_personality_v0, so this links only if ours coalesces with the other Rust copy
-# (AetherEngine#752). Both link orders, and the panic selftest must still pass in the result.
+# Compact unwind encodes at most three personality routines per image (AetherEngine#752). The
+# framework is an image of its own and exports nothing but the C API, so a host carrying a Rust
+# static library, Objective-C and C++ stays at three, and every one of them, ours included, must
+# still catch its own exception or panic. Both link orders.
 echo
 echo "======== next to a second Rust library, Objective-C and C++"
 cat >"$OUT/other_rust.rs" <<'EOF'
@@ -204,16 +206,17 @@ extern "C" int host_cxx_catches(void) {
 EOF
 if (cd "$CRATE" && rustc --edition 2024 -O --crate-type staticlib --target aarch64-apple-darwin \
         "$OUT/other_rust.rs" -o "$OUT/libother_rust.a") 2>"$OUT/coexist.log" &&
-    xcrun clang -c -mmacosx-version-min=15.0 -fobjc-exceptions -I"$MAC/Headers/DTSX" \
+    xcrun clang -c -mmacosx-version-min=15.0 -fobjc-exceptions -I"$MAC/DTSX.framework/Headers" \
         "$OUT/host_objc.m" -o "$OUT/host_objc.o" 2>>"$OUT/coexist.log" &&
     xcrun clang++ -c -mmacosx-version-min=15.0 "$OUT/host_cxx.cpp" -o "$OUT/host_cxx.o" 2>>"$OUT/coexist.log"; then
     for order in other-first dtsx-first; do
-        if [ "$order" = other-first ]; then libs=("$OUT/libother_rust.a" "$MAC/libdtsx.a")
-        else libs=("$MAC/libdtsx.a" "$OUT/libother_rust.a"); fi
+        read -r -a dtsx <<<"$(link_flags macos-arm64_x86_64)"
+        if [ "$order" = other-first ]; then libs=("$OUT/libother_rust.a" "${dtsx[@]}")
+        else libs=("${dtsx[@]}" "$OUT/libother_rust.a"); fi
         if xcrun clang++ -mmacosx-version-min=15.0 "$OUT/host_objc.o" "$OUT/host_cxx.o" "${libs[@]}" \
                 -framework Foundation -o "$OUT/coexist-$order" 2>>"$OUT/coexist.log" &&
             "$OUT/coexist-$order" 2>/dev/null; then
-            echo "  $order: links with one Rust personality, all four catch"
+            echo "  $order: links, all four catch"
         else
             echo "  $order: FAILED"
             cat "$OUT/coexist.log"
@@ -227,7 +230,7 @@ else
 fi
 
 echo
-echo "======== Swift through the module map"
+echo "======== Swift through the framework module"
 cat >"$OUT/swift_check.swift" <<'EOF'
 import Foundation
 import DTSX
@@ -269,7 +272,7 @@ exit(blocks > 0 && status == DTSX_NEED_MORE_DATA ? 0 : 1)
 EOF
 swift_sample=""
 for entry in ${present[@]+"${present[@]}"}; do read -r name _ <<<"$entry"; swift_sample="$SAMPLES/$name"; done
-if xcrun swiftc -O -I "$MAC/Headers/DTSX" "$OUT/swift_check.swift" "$MAC/libdtsx.a" \
+if xcrun swiftc -O -F "$MAC" -Xlinker -rpath -Xlinker "$MAC" "$OUT/swift_check.swift" \
     -o "$OUT/swift_check" 2>"$OUT/swift.log" &&
     "$OUT/swift_check" "$SAMPLES/fate-master-audio-7.1.dts" refused 2>/dev/null &&
     { [ -z "$swift_sample" ] || "$OUT/swift_check" "$swift_sample" 2>/dev/null; }; then

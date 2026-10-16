@@ -1,4 +1,4 @@
-module DTSX {
-    header "dtsx.h"
+framework module DTSX {
+    umbrella header "dtsx.h"
     export *
 }

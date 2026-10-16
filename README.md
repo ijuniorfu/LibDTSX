@@ -4,7 +4,8 @@ A C-callable decoder for DTS:X on Apple platforms. It decodes the lossless DTS-H
 stream DTS:X is carried on and returns everything a renderer needs to place it in a room: the
 compatible bed with the encoder's spatial folds removed, the fixed height channels, and the
 objects of the alternate presentations with their positions and timed updates. It ships as
-`DTSX.xcframework` with a Swift package, for iOS, tvOS, macOS and visionOS.
+`DTSX.xcframework`, a dynamic framework per platform, with a Swift package, for iOS, tvOS, macOS
+and visionOS. The built library is LGPL-3.0-or-later, see [License](#license).
 
 Its API has the shape of [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)'s, so a
 host that renders TrueHD Atmos objects into a speaker bed can render DTS:X with the same code:
@@ -12,7 +13,7 @@ planar float channels, a speaker code or "object" per channel, and metadata upda
 positions in the room coordinates Dolby Atmos uses.
 
 The decoding is the [`dca`](https://github.com/harletty/harletty-bridge/tree/a717bae441b116485f0254603dc20a6ede65d8c6/dca)
-crate from harletty-bridge (Apache-2.0), pinned to an exact commit. This repository adds the C API,
+crate from harletty-bridge, a port of FFmpeg's `dca` decoder, pinned to an exact commit. This repository adds the C API,
 the framing and input timeline, the DTS:X verdict, the spatial reconstruction (which follows
 [SpatialAudioBridge](https://github.com/kristofferR/SpatialAudioBridge)'s DTS:X decoder), the
 conversion of DTS:X object angles into room coordinates, and the Apple packaging.
@@ -20,7 +21,7 @@ conversion of DTS:X object angles into room coordinates, and the Apple packaging
 ## Use
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMinor(from: "1.0.1")),
+.package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMajor(from: "2.0.0")),
 // target dependency:
 .product(name: "DTSX", package: "LibDTSX"),
 ```
@@ -95,10 +96,11 @@ here (`DTSXStreamInfo.experimental`).
 
 Requires Xcode and rustup. The toolchain and targets are pinned in `rust-toolchain.toml` (stable
 Rust; every Apple target used here ships a prebuilt std). The script builds each slice with fat
-LTO, prelinks it so only the `dtsx_*` functions and a weak `rust_eh_personality` are global (so it
-links next to other Rust static libraries such as LibTrueHD and LibDovi, and shares their
-personality routine: compact unwind encodes at most three per image), and assembles the xcframework. Source paths are remapped
-so the binaries carry no build-machine paths. Minimum OS: iOS 18, tvOS 18, macOS 15, visionOS 1.
+LTO as a dynamic library that exports only the `dtsx_*` functions (Rust's runtime, its personality
+routine included, stays inside the framework, so it sits next to other Rust libraries such as
+LibTrueHD and LibDovi without colliding), wraps it in `DTSX.framework` with a dSYM for each device
+slice, and assembles the xcframework. Source paths are remapped so the binaries carry no
+build-machine paths. Minimum OS: iOS 18, tvOS 18, macOS 15, visionOS 1.
 
 ## Verify
 
@@ -143,9 +145,23 @@ runs at about 200× real time for 7.1.4 and 150× for 7.1.4+5 on one core of a d
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE). The built library also contains the `dca` crate (Apache-2.0)
-and other Rust dependencies; [NOTICE](NOTICE) lists them, and anyone redistributing the
-xcframework must keep both files with it.
+The source in this repository is Apache-2.0, see [LICENSE](LICENSE). The **built library is
+LGPL-3.0-or-later**, and that is what an app embedding it receives:
+
+- The `dca` crate is labelled Apache-2.0 upstream, but its sources say it is a port of FFmpeg's
+  `dca` decoder (`libavcodec/dca*.c`, tables generated from the libavcodec sources), which is
+  LGPL-2.1-or-later. It is treated as a work based on FFmpeg under that license
+  ([AetherEngine#798](https://github.com/superuser404notfound/AetherEngine/issues/798)).
+- The Apache-2.0 code it is combined with is compatible with version 3 of the GNU licenses, not
+  with version 2, so the combination is LGPL-3.0-or-later.
+
+For that reason every slice is a **dynamic framework** with an `@rpath` install name, never a static
+library: Xcode embeds and signs it in the app bundle, and the app stays closed source if it wants,
+as long as a user can swap in a modified `DTSX.framework` (LGPL section 4). An app shipping it
+should name the library and its license, point to this repository and the `dca` commit as the
+corresponding source, and not prevent replacing the framework. The license texts are in
+[LICENSES/](LICENSES/), and [NOTICE](NOTICE) lists every component; anyone redistributing the
+xcframework must keep both with it.
 
 DTS, DTS-HD, DTS-HD Master Audio and DTS:X are trademarks of DTS, Inc. or its affiliates. This
 project is not affiliated with or endorsed by DTS.
