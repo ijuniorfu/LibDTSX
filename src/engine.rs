@@ -1,17 +1,16 @@
-//! The decoder behind a handle: framing, decoding, the DTS:X verdict, fold removal, channel
+//! The decoder behind a handle: framing, decoding, the DTS:X verdict, height removal, channel
 //! roles, metadata and recovery. Everything here is safe Rust; `lib.rs` wraps it for C.
 //!
-//! The spatial reconstruction follows SpatialAudioBridge's DTS:X decoder (Apache-2.0,
-//! kristofferR/SpatialAudioBridge): presentation detection and metadata come from `dca`,
-//! every stated or recomputable fold is subtracted from the bed before the bed and the
-//! extension feeds are rendered side by side, and anything unresolved is never rendered twice.
+//! Only the standard presentation is rendered: a 7.1 bed and four fixed height channels, each
+//! height carried in the bed speaker under it at -3 dB (TFL in L, TFR in R, TBL in Lsr, TBR in
+//! Rsr). That fold is the standard's own constant, so it is removed as such; the private
+//! metadata is not read, and every frame of every film measured carried exactly this fold. The
+//! alternate presentations, which carry objects, are refused, so a host plays them as 7.1.
 
 use crate::framer::{AuInfo, Framer, Next};
-use crate::position::{room_position, speaker_position};
+use crate::position::speaker_position;
 use crate::types::*;
-use dca::{
-    FoldPlan, FoldRenderer, HdDecoder, HdError, HdFrame, SourceRole, XMetadata, XPresentation,
-};
+use dca::{FoldPlan, HdDecoder, HdError, HdFrame, XPresentation};
 use std::any::Any;
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -29,6 +28,12 @@ const MAX_UNDECODABLE_BEFORE_VERDICT: u32 = 8;
 /// error a median 2.7 dB below the signal) and the second can still err by -16 dBFS; from the
 /// third the error peaked at -33 dBFS and decayed to bit-exact within about ten frames.
 const PRIMING_FRAMES: u32 = 2;
+/// Gain of each standard height in the bed speaker under it: -3 dB, the six-bit gain code 55 of
+/// the DTS downmix table (23170 / 32768).
+const STANDARD_HEIGHT_FOLD: f32 = 23170.0 / 32768.0;
+/// DCA speakers of the 7.1 bed the standard presentation is authored over: C, L, R, Ls, Rs, LFE,
+/// Lsr, Rsr.
+const BED_7_1: [usize; 8] = [0, 1, 2, 3, 4, 5, 7, 8];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -46,19 +51,12 @@ struct Roles {
     speakers: [u8; MAX_CHANNELS],
 }
 
-/// One frame's spatial reconstruction, when its extension can be applied.
-struct Spatial {
-    metadata: XMetadata,
-    plan: FoldPlan,
-}
-
 pub struct Engine {
     framer: Framer,
     decoder: Box<HdDecoder>,
     frame: Box<HdFrame>,
-    folds: FoldRenderer,
-    /// The presentation `folds` last rendered, whose gains it ramps from.
-    fold_presentation: Option<XPresentation>,
+    /// The standard height fold, removed from every bed of a frame whose extension applies.
+    fold: FoldPlan,
     verdict: Verdict,
     undecodable_in_a_row: u32,
     /// Frames still to decode without output (see PRIMING_FRAMES).
@@ -99,8 +97,7 @@ impl Engine {
             framer: Framer::default(),
             decoder: Box::new(HdDecoder::new()),
             frame: Box::default(),
-            folds: FoldRenderer::new(),
-            fold_presentation: None,
+            fold: FoldPlan::standard_heights(STANDARD_HEIGHT_FOLD),
             verdict: Verdict::Pending,
             undecodable_in_a_row: 0,
             priming: PRIMING_FRAMES,
@@ -150,8 +147,6 @@ impl Engine {
     pub fn reset(&mut self) {
         self.framer.reset();
         self.decoder.reset();
-        self.folds.reset();
-        self.fold_presentation = None;
         self.undecodable_in_a_row = 0;
         self.priming = PRIMING_FRAMES;
         self.input_frames = 0;
@@ -213,7 +208,6 @@ impl Engine {
     fn break_continuity(&mut self) {
         self.pending_flags |= BLOCK_DISCONTINUITY;
         self.restate = true;
-        self.fold_presentation = None;
         self.priming = PRIMING_FRAMES;
     }
 
@@ -340,62 +334,33 @@ impl Engine {
     }
 
     /// A decoded frame that only rebuilds decoder history: no block, but its samples count on the
-    /// input timeline and the fold renderer advances through it, so the first block's folds ramp
-    /// from this frame's as they would in a continuous decode.
+    /// input timeline.
     fn prime(&mut self) {
         self.priming -= 1;
         let frames = self.frame.bed_sample_count();
-        let _ = self.spatial(XPresentation::detect(&self.frame), frames);
         self.nominal_frames = frames as u32;
         self.input_frames += frames as u64;
         self.stats.access_units_decoded += 1;
         self.stats.access_units_skipped += 1;
     }
 
-    /// The frame's spatial reconstruction, or why it cannot be applied.
-    fn spatial(
-        &mut self,
-        presentation: Option<XPresentation>,
-        frames: usize,
-    ) -> Result<Spatial, String> {
+    /// Whether the frame's heights can be removed from its bed, or why not.
+    fn heights_apply(&self) -> Result<(), String> {
         let frame = &self.frame;
         if let Some(error) = frame.x_decode_error {
             return Err(format!("DTS:X extension decoding: {error}"));
         }
-        let presentation = presentation.ok_or("frame without a DTS:X extension")?;
-        let metadata = XMetadata::parse(&frame.x_payload, presentation.feed_count())
-            .map_err(|e| format!("DTS:X metadata: {e:?}"))?;
-        if metadata.source_count() != presentation.feed_count() {
-            return Err("DTS:X metadata does not match its feed count".into());
+        if !is_7_1(frame) {
+            return Err("DTS:X frame over a bed other than 7.1".into());
         }
-        for feed in 0..presentation.feed_count() {
-            let source = metadata
-                .source(feed)
-                .ok_or("DTS:X metadata misses a source")?;
-            let matches = match source.role {
-                SourceRole::Object { .. } => presentation.object_feeds().contains(&feed),
-                SourceRole::Height(channel) => {
-                    presentation.fixed_feeds().contains(&feed)
-                        && presentation.fixed_channels()[feed - presentation.fixed_feeds().start]
-                            == channel
-                }
-            };
-            if !matches {
-                return Err("DTS:X source role does not match its presentation".into());
-            }
+        match XPresentation::detect(frame) {
+            Some(XPresentation::Height) => Ok(()),
+            Some(other) => Err(format!(
+                "DTS:X frame in the {} presentation, which is not rendered",
+                other.layout_label()
+            )),
+            None => Err("frame without a DTS:X extension".into()),
         }
-        // The fold renderer ramps from the previous frame's gains, which only mean anything for
-        // the same presentation.
-        if self.fold_presentation != Some(presentation) {
-            self.folds.reset();
-            self.fold_presentation = Some(presentation);
-        }
-        let mut plan = FoldPlan::from_metadata(&metadata);
-        self.folds.apply(&mut plan, &metadata, frames);
-        if plan.has_unknown() {
-            return Err("DTS:X bed fold not stated; the frame plays its bed as authored".into());
-        }
-        Ok(Spatial { metadata, plan })
     }
 
     fn emit(
@@ -409,11 +374,9 @@ impl Engine {
         if frames == 0 || frames > MAX_BLOCK_FRAMES {
             return Err(format!("DTS-HD frame of {frames} samples"));
         }
-        let detected = XPresentation::detect(&self.frame);
-        // A frame without a usable extension keeps the stream's layout, with silent feeds.
-        let presentation = detected
-            .or(self.presentation)
-            .ok_or("no DTS:X presentation")?;
+        // The verdict accepted the standard presentation only; a frame without a usable
+        // extension keeps its layout, with silent heights.
+        let presentation = XPresentation::Height;
 
         let mut bed: [(usize, u8); MAX_CHANNELS] = [(0, SPEAKER_UNKNOWN); MAX_CHANNELS];
         let mut bed_count = 0;
@@ -428,38 +391,32 @@ impl Engine {
             bed[bed_count] = (index, bed_speaker(index));
             bed_count += 1;
         }
-        let objects = presentation.object_feeds().len();
         let fixed = presentation.fixed_channels();
-        let channels = bed_count + objects + fixed.len();
+        let channels = bed_count + fixed.len();
 
-        let spatial = if detected == Some(presentation) {
-            self.spatial(detected, frames)
-        } else {
-            Err("frame without a DTS:X extension".into())
-        };
-        let spatial = match spatial {
-            Ok(spatial) => Some(spatial),
+        let applies = match self.heights_apply() {
+            Ok(()) => true,
             Err(message) => {
                 self.set_error(message);
-                None
+                false
             }
         };
 
-        // Planes: the bed with every fold removed (or as authored), then the feeds.
+        // Planes: the bed with the heights removed (or as authored), then the heights.
         for (k, &(index, _)) in bed[..bed_count].iter().enumerate() {
             let pcm = self.frame.samples[index].as_deref().unwrap_or_default();
             let plane = &mut self.planes[k][..frames];
-            match &spatial {
-                Some(s) => s
-                    .plan
-                    .clean_channel(index, pcm, &self.frame.x_samples, plane),
-                None => plane.copy_from_slice(pcm),
+            if applies {
+                self.fold
+                    .clean_channel(index, pcm, &self.frame.x_samples, plane);
+            } else {
+                plane.copy_from_slice(pcm);
             }
         }
-        for feed in 0..objects + fixed.len() {
+        for feed in 0..fixed.len() {
             let plane = &mut self.planes[bed_count + feed][..frames];
-            match (&spatial, self.frame.x_samples.get(feed)) {
-                (Some(_), Some(pcm)) => plane.copy_from_slice(&pcm[..frames]),
+            match self.frame.x_samples.get(feed) {
+                Some(pcm) if applies => plane.copy_from_slice(&pcm[..frames]),
                 _ => plane.fill(0.0),
             }
         }
@@ -471,22 +428,8 @@ impl Engine {
             speakers[k] = code;
             elements[k] = fixed_element(code);
         }
-        for feed in 0..objects {
-            let c = bed_count + feed;
-            speakers[c] = SPEAKER_OBJECT;
-            elements[c] = match &spatial {
-                Some(s) => object_element(s.metadata.source(feed).map(|s| s.role)),
-                // Hold the last known position; the feed is silent anyway.
-                None if self.roles.is_some_and(|r| r.speakers[c] == SPEAKER_OBJECT) => {
-                    let mut held = self.elements[c];
-                    held.flags &= !EL_CHANGED;
-                    held
-                }
-                None => object_element(None),
-            };
-        }
         for (i, &channel) in fixed.iter().enumerate() {
-            let c = bed_count + objects + i;
+            let c = bed_count + i;
             let code = fixed_speaker(channel);
             speakers[c] = code;
             elements[c] = fixed_element(code);
@@ -507,7 +450,7 @@ impl Engine {
             self.restate = true;
         }
         self.presentation = Some(presentation);
-        if spatial.is_none() {
+        if !applies {
             flags |= BLOCK_BED_AS_AUTHORED;
             self.stats.bed_as_authored += 1;
         }
@@ -537,7 +480,7 @@ impl Engine {
         self.metadata = Metadata {
             element_count: channels as u32,
             bed_count: bed_count as u32,
-            object_count: objects as u32,
+            object_count: 0,
             fixed_count: fixed.len() as u32,
             update_count: changed as u32,
             reserved: 0,
@@ -557,7 +500,7 @@ impl Engine {
             sample_rate: self.frame.sample_rate,
             access_unit_frames: self.nominal_frames,
             presentation: presentation_code(presentation),
-            experimental: presentation.is_experimental() as u32,
+            experimental: 0,
             alternate_marker: self.frame.x_imax as u32,
             bed_mask: self.frame.output_mask,
             channel_count: channels as u32,
@@ -626,19 +569,54 @@ fn judge(frame: &HdFrame) -> Judgement {
             "lossless DTS-HD Master Audio without a DTS:X extension".into(),
         );
     }
-    if XPresentation::detect(frame).is_some() {
-        return Judgement::Accept;
+    match XPresentation::detect(frame) {
+        Some(XPresentation::Height) => {}
+        Some(other) => {
+            return Judgement::Refuse(
+                ERR_UNSUPPORTED,
+                format!(
+                    "DTS:X in the {} presentation, with objects: only the standard 7.1.4 \
+                     presentation is rendered",
+                    other.layout_label()
+                ),
+            );
+        }
+        None => {
+            return match frame.x_decode_error {
+                Some(error) => Judgement::Retry(format!("DTS:X extension decoding: {error}")),
+                None => Judgement::Refuse(
+                    ERR_UNSUPPORTED,
+                    format!(
+                        "DTS:X extension with {} feeds matches no known presentation",
+                        frame.x_samples.len()
+                    ),
+                ),
+            };
+        }
     }
-    match frame.x_decode_error {
-        Some(error) => Judgement::Retry(format!("DTS:X extension decoding: {error}")),
-        None => Judgement::Refuse(
+    // The standard presentation is authored over the 7.1 bed, and its heights are folded into
+    // L, R, Lsr and Rsr; any other bed is not one it describes.
+    if !is_7_1(frame) {
+        return Judgement::Refuse(
             ERR_UNSUPPORTED,
             format!(
-                "DTS:X extension with {} feeds matches no known presentation",
-                frame.x_samples.len()
+                "DTS:X over a bed other than 7.1 (mask {:#06x})",
+                frame.output_mask
             ),
-        ),
+        );
     }
+    Judgement::Accept
+}
+
+/// Whether the frame's bed is exactly the 7.1 the standard presentation is authored over.
+fn is_7_1(frame: &HdFrame) -> bool {
+    frame
+        .samples
+        .iter()
+        .enumerate()
+        .filter(|(_, channel)| channel.is_some())
+        .map(|(index, _)| index)
+        .eq(BED_7_1)
 }
 
 fn presentation_code(presentation: XPresentation) -> u32 {
@@ -725,29 +703,6 @@ fn fixed_element(code: u8) -> Element {
     }
 }
 
-fn object_element(role: Option<SourceRole>) -> Element {
-    let (azimuth, elevation, distance) = match role {
-        Some(SourceRole::Object { position, .. }) => (
-            position.azimuth_degrees() as f32,
-            position.elevation_degrees() as f32,
-            position.distance() as f32,
-        ),
-        // No position known yet: the front centre at the reference radius.
-        _ => (0.0, 0.0, 1.0),
-    };
-    Element {
-        kind: ELEMENT_OBJECT,
-        speaker: SPEAKER_OBJECT,
-        flags: EL_ACTIVE,
-        position: room_position(azimuth, elevation, distance),
-        gain: 1.0,
-        azimuth,
-        elevation,
-        distance,
-        ..Element::EMPTY
-    }
-}
-
 pub fn panic_message(payload: &Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -755,5 +710,83 @@ pub fn panic_message(payload: &Box<dyn Any + Send>) -> String {
         s.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lossless DTS:X frame over the 7.1 bed `indices`, with `feeds` extension waveforms.
+    fn frame(indices: &[usize], feeds: usize, imax: bool) -> HdFrame {
+        let mut samples = vec![None; 9];
+        for &index in indices {
+            samples[index] = Some(vec![0.0; 512]);
+        }
+        HdFrame {
+            samples,
+            lossless: true,
+            x_present: !imax,
+            x_imax: imax,
+            x_samples: vec![vec![0.0; 512]; feeds],
+            ..HdFrame::default()
+        }
+    }
+
+    #[test]
+    fn the_standard_presentation_is_accepted() {
+        assert!(matches!(
+            judge(&frame(&BED_7_1, 4, false)),
+            Judgement::Accept
+        ));
+    }
+
+    #[test]
+    fn every_presentation_with_objects_is_refused() {
+        for (feeds, bed) in [
+            (5, &BED_7_1[..]),
+            (6, &BED_7_1),
+            (7, &BED_7_1),
+            (8, &BED_7_1),
+            (9, &BED_7_1),
+            (1, &[0, 1, 2, 3, 4, 5][..]),
+        ] {
+            let refused = matches!(
+                judge(&frame(bed, feeds, true)),
+                Judgement::Refuse(ERR_UNSUPPORTED, _)
+            );
+            assert!(refused, "{feeds} feeds");
+        }
+    }
+
+    #[test]
+    fn heights_over_a_bed_other_than_7_1_are_refused() {
+        let mut with_back_centre = BED_7_1.to_vec();
+        with_back_centre.push(6);
+        assert!(matches!(
+            judge(&frame(&with_back_centre, 4, false)),
+            Judgement::Refuse(ERR_UNSUPPORTED, _)
+        ));
+        assert!(matches!(
+            judge(&frame(&[0, 1, 2, 3, 4, 5], 4, false)),
+            Judgement::Refuse(ERR_UNSUPPORTED, _)
+        ));
+    }
+
+    /// DCA bed speakers the four standard heights are folded into, in feed order (L, R, Lsr, Rsr).
+    const STANDARD_FOLD_SPEAKERS: [usize; 4] = [1, 2, 7, 8];
+
+    #[test]
+    fn the_standard_fold_is_minus_3_db_into_the_speaker_under_each_height() {
+        let plan = FoldPlan::standard_heights(STANDARD_HEIGHT_FOLD);
+        for speaker in 0..9 {
+            for (feed, &under) in STANDARD_FOLD_SPEAKERS.iter().enumerate() {
+                let expected = if under == speaker { 0.707_092_3 } else { 0.0 };
+                assert!(
+                    (plan.gain(speaker, feed) - expected).abs() < 1e-6,
+                    "{speaker} {feed}"
+                );
+            }
+        }
     }
 }

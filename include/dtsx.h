@@ -2,10 +2,10 @@
  * dtsx.h - C API of the LibDTSX decoder library.
  *
  * Decodes DTS:X carried on a lossless DTS-HD Master Audio stream to planar float PCM, ready to
- * render: the compatible bed with every spatial contribution the encoder folded into it removed,
- * the fixed height channels, and the objects of the alternate presentations with their
- * positions, in the room coordinates Dolby Atmos object metadata uses. Built on the Rust `dca`
- * crate from https://github.com/harletty/harletty-bridge (Apache-2.0).
+ * render: the compatible 7.1 bed with the four fixed height channels removed from it, and the
+ * heights on their own channels. Only the standard presentation is rendered; the alternate
+ * presentations, which carry objects, are refused. Built on the Rust `dca` crate from
+ * https://github.com/harletty/harletty-bridge (Apache-2.0).
  *
  * Model
  *   create -> [push bytes -> pull blocks until NEED_MORE_DATA]* -> destroy
@@ -25,13 +25,15 @@
  *     DTSX_ERR_NOT_DTSX       the stream carries no DTS:X extension: plain DTS-HD MA, a DTS core
  *                             or DTS-HD High Resolution Audio, or no DTS frame in the first MiB.
  *     DTSX_ERR_UNSUPPORTED    it carries one this library does not render: DTS:X on a lossy
- *                             carrier, an extension that matches no known presentation, or a
- *                             stream whose first frames all fail to decode.
+ *                             carrier, an alternate presentation (objects), heights over a bed
+ *                             without the 7.1 speakers they are folded into, an extension that
+ *                             matches no known presentation, or a stream whose first frames
+ *                             all fail to decode. A host plays such a stream as plain 7.1.
  *   A refusal is returned by every later push() and pull() until destroy(); reset() keeps it,
  *   since it describes the stream, not a position in it. After a stream has been accepted,
  *   nothing about its content makes pull() fail: a frame whose extension cannot be applied
- *   (no extension, metadata that does not parse, a fold the stream does not state) is returned
- *   with DTSX_BLOCK_BED_AS_AUTHORED, see below.
+ *   (no extension, an extension that does not decode, a frame in another presentation) is
+ *   returned with DTSX_BLOCK_BED_AS_AUTHORED, see below.
  *
  * Threading
  *   A decoder handle is not thread-safe: call it from one thread at a time. Separate handles
@@ -106,14 +108,12 @@ typedef int32_t DTSXStatus;
 /* ------------------------------------------------------------------------------------------ */
 /* Presentations                                                                              */
 /*
- * What the DTS:X extension of a frame carries next to the compatible bed. The standard
- * presentation is the only one established by DTS:X content at large; the alternates are
- * classified by the `dca` crate from a corpus and are experimental there and here
- * (DTSXStreamInfo.experimental). All eight DTS:X films in a library census used the standard
- * one in every frame.
- *
- * Every presentation's channels come in this order: the bed channels in DCA speaker order,
- * then the objects, then the fixed channels.
+ * What the DTS:X extension of a frame carries next to the compatible bed. Only the standard
+ * presentation is rendered, and every block carries it: the 7.1 bed channels in DCA speaker
+ * order, then the four heights. The alternates, classified by the `dca` crate from a corpus,
+ * carry objects; a stream in one is refused (DTSX_ERR_UNSUPPORTED), and the codes remain so
+ * last_error() and dtsx_presentation_name() can name it. All twelve DTS:X tracks of a library
+ * census used the standard presentation in every frame.
  */
 #define DTSX_PRESENTATION_HEIGHT 0u       /* 7.1.4: four fixed heights (Tfl, Tfr, Tbl, Tbr) */
 #define DTSX_PRESENTATION_OBJECT_D0 1u    /* 7.1.4+1: one object, then the four heights */
@@ -157,7 +157,7 @@ typedef int32_t DTSXStatus;
 #define DTSX_SPEAKER_RW ((uint8_t)21)  /* right wide (DTS Rw) */
 #define DTSX_SPEAKER_TFC ((uint8_t)22) /* top front centre (DTS Ch) */
 #define DTSX_SPEAKER_LFE2 ((uint8_t)23)
-/** The channel is an object, positioned by metadata. */
+/** An object channel; no block carries one (see COORDINATES). */
 #define DTSX_SPEAKER_OBJECT ((uint8_t)254)
 /** A bed speaker this API has no code for. */
 #define DTSX_SPEAKER_UNKNOWN ((uint8_t)255)
@@ -170,33 +170,17 @@ typedef int32_t DTSXStatus;
  *   x: 0 = left wall      .. 1 = right wall
  *   y: 0 = front wall     .. 1 = back wall
  *   z: 0 = listener (ear-level) plane .. 1 = ceiling
- * DTS:X states object positions as physical angles around the listener (azimuth, elevation,
- * distance), which DTSXElement also reports as transmitted. The library places them in the
- * room by projecting the reference sphere onto the room's boundary:
- *   - Azimuth (0 = front, positive = right) runs along the walls, piecewise linear between the
- *     angles of the speakers that sit there: centre 0° at (0.5, 0), front ±30° at the front
- *     corners, wide ±60° a quarter down the side walls, side ±90° halfway down them, rear
- *     ±145° at the back corners and back centre 180° at (0.5, 1). A renderer that pans
- *     between neighbouring speakers by room position therefore places a sound between two
- *     speakers in the same proportion as one that pans by angle.
- *   - Elevation (degrees, positive = up) sets z = elevation / 45, reaching the ceiling at 45°,
- *     the elevation of a height speaker. Above 45° the position moves on across the ceiling
- *     towards its centre, which it reaches at 90°. Negative elevations are placed at ear level.
- *   - Distance (1 = the reference radius, the speakers) moves the position towards the
- *     listener at the room's centre, (0.5, 0.5, 0), in proportion: an object at distance 0.5
- *     sits halfway between there and its point on the boundary. Distances beyond the
- *     reference radius are placed on it.
- * These are approximations of DTS:X rendering, not DTS reference-renderer behaviour.
- *
- * Bed and fixed channels (kind BED/LFE) carry their speaker's nominal position in the same
- * coordinates (LFE at the front centre, z = 0).
+ * Every element is a bed or fixed channel (kind BED/LFE) at its speaker's nominal position
+ * (LFE at the front centre, z = 0). No block carries objects; DTSX_ELEMENT_OBJECT,
+ * DTSX_SPEAKER_OBJECT and the azimuth, elevation and distance fields remain in the API and
+ * are never set.
  *
  * TIMING: DTS:X restates its metadata with every frame. An update is delivered at frame_offset
  * 0 of the block whose frame stated it, whenever an element differs from the previous frame:
  * ramp each changed element linearly from its previous values to the update's over
- * ramp_frames frames, which is the block's frame_count, so a moving object reaches its new
- * position on the frame's last sample (frame i of the ramp, from 0, plays at (i + 1) /
- * ramp_frames of the way). The first block after create/reset/DISCONTINUITY, and the first of
+ * ramp_frames frames, which is the block's frame_count (frame i of the ramp, from 0, plays at
+ * (i + 1) / ramp_frames of the way). The fixed channels never move, so in practice only the
+ * first block after a jump carries one. The first block after create/reset/DISCONTINUITY, and the first of
  * a new layout, carries an update describing every element (all CHANGED) with ramp_frames 0:
  * apply it as a jump. Elements without DTSX_ELEMENT_CHANGED are unchanged; do not restart
  * their ramps.
@@ -205,10 +189,10 @@ typedef int32_t DTSXStatus;
 /* DTSXElement.kind */
 #define DTSX_ELEMENT_BED ((uint8_t)0)     /* speaker-anchored channel; see .speaker */
 #define DTSX_ELEMENT_LFE ((uint8_t)1)     /* LFE or LFE2 */
-#define DTSX_ELEMENT_OBJECT ((uint8_t)2)  /* object, positioned by .position */
+#define DTSX_ELEMENT_OBJECT ((uint8_t)2)  /* object; never produced */
 
 /* DTSXElement.flags */
-#define DTSX_ELEMENT_ACTIVE 0x001u   /* always set: DTS:X states no object as inactive */
+#define DTSX_ELEMENT_ACTIVE 0x001u   /* always set */
 #define DTSX_ELEMENT_CHANGED 0x002u  /* in an update: differs from the previous values */
 
 typedef struct DTSXElement {
@@ -217,10 +201,10 @@ typedef struct DTSXElement {
     uint8_t reserved[2];
     uint32_t flags;        /* DTSX_ELEMENT_* */
     float position[3];     /* x, y, z; see COORDINATES above */
-    float gain;            /* linear amplitude gain: 1 (DTS:X objects carry their level in the PCM) */
-    float azimuth;         /* objects: transmitted azimuth in degrees, 0 = front, positive = right */
-    float elevation;       /* objects: transmitted elevation in degrees, positive = up */
-    float distance;        /* objects: transmitted distance, 1 = reference radius; else 0 */
+    float gain;            /* linear amplitude gain: 1 */
+    float azimuth;         /* 0: objects only, which no block carries */
+    float elevation;       /* 0 */
+    float distance;        /* 0 */
 } DTSXElement;             /* 36 bytes */
 
 typedef struct DTSXMetadataUpdate {
@@ -232,7 +216,7 @@ typedef struct DTSXMetadataUpdate {
 typedef struct DTSXMetadata {
     uint32_t element_count;   /* == DTSXBlock.channel_count; element i is channel i */
     uint32_t bed_count;       /* elements [0, bed_count) are the bed channels (incl. LFE) */
-    uint32_t object_count;    /* then object_count objects */
+    uint32_t object_count;    /* always 0 */
     uint32_t fixed_count;     /* then fixed_count fixed channels, up to element_count */
     uint32_t update_count;    /* updates starting inside this block (0 or 1) */
     uint32_t reserved;
@@ -248,19 +232,20 @@ typedef struct DTSXMetadata {
  * SAMPLE RATE: blocks carry the stream's own rate; nothing is resampled. DTS:X is 48 kHz in
  * all content tested.
  *
- * BED: the bed channels are the stream's lossless compatible bed with every spatial
- * contribution the encoder folded into it subtracted, at the gains the frame's metadata states
- * (or, for objects it marks as panned into the bed from their position, at the gains the
- * `dca` crate's fold renderer recomputes). The bed, objects and fixed channels are therefore
- * meant to be rendered side by side: summing them back into the bed speakers reproduces the
- * compatible mix.
+ * BED: the bed channels are the stream's lossless compatible bed with the four heights removed
+ * from it. The standard presentation carries each height in the bed speaker under it at -3 dB
+ * (Tfl in L, Tfr in R, Tbl in Lb, Tbr in Rb); that constant is subtracted, and the stream's
+ * private metadata is not read. Every frame of the twelve DTS:X tracks measured carried exactly
+ * this fold, so the result is bit-identical to subtracting the gains the stream states. The bed
+ * and the heights are therefore meant to be rendered side by side, each on its own speaker:
+ * summing the heights back into the bed speakers reproduces the compatible mix.
  *
- * BED AS AUTHORED: when a frame's extension cannot be applied (the frame has none, its
- * metadata does not parse or does not match the presentation, or a fold is not stated and
- * cannot be recomputed), the block carries DTSX_BLOCK_BED_AS_AUTHORED: its bed channels are
- * the compatible mix as transmitted, the objects and fixed channels are silent, and the layout
- * stays that of the stream. Nothing is lost or played twice; the frame's heights and objects
- * play from the bed speakers they were folded into. None of the films tested had such frames.
+ * BED AS AUTHORED: when a frame's extension cannot be applied (the frame has none, it does not
+ * decode, or the frame is in another presentation), the block carries
+ * DTSX_BLOCK_BED_AS_AUTHORED: its bed channels are the compatible mix as transmitted, the
+ * heights are silent, and the layout stays 7.1.4. Nothing is lost or played twice; the frame's
+ * heights play from the bed speakers they were folded into. None of the films tested had such
+ * frames.
  *
  * INPUT TIMELINE: input_access_unit counts every DTS-HD frame in the bytes pushed since
  * create()/reset(), in stream order, whether or not it was decoded: frames the lossless
@@ -323,7 +308,7 @@ typedef struct DTSXStreamInfo {
     uint32_t sample_rate;
     uint32_t access_unit_frames;
     uint32_t presentation;        /* DTSX_PRESENTATION_* of the most recent frame with one */
-    uint32_t experimental;        /* 1: an alternate presentation (see Presentations) */
+    uint32_t experimental;        /* always 0: alternate presentations are refused */
     uint32_t alternate_marker;    /* 1: the extension carries the alternate syncword, which
                                      FFmpeg reports as "DTS:X IMAX"; not proof of IMAX content */
     uint32_t bed_mask;            /* DCA speaker mask of the compatible bed */

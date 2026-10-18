@@ -9,16 +9,17 @@
 # 1. Samples. FFmpeg's FATE plain DTS-HD Master Audio 7.1 stream is downloaded. DTS:X samples
 #    have no stable public URL, so the two DTS:X streams are read from $DTSX_WORK/samples and
 #    checked against the SHA-256 values SpatialAudioBridge validated; README.md says where to get
-#    them. A missing one is reported and its checks are skipped.
+#    them. A missing one is reported and its checks are skipped. $DTSX_LOCAL_SAMPLES may name
+#    more streams in the standard presentation (excerpts of films, say), checked like the first.
 # 2. Clones SpatialAudioBridge at the commit pinned below, builds its `render` example and renders
-#    each DTS:X sample to 7.1.4: the bed with every fold removed, the fixed heights on their
-#    speakers and the objects panned by angle.
+#    each standard DTS:X sample to 7.1.4: the bed with the folds the stream states removed and the
+#    fixed heights on their speakers.
 # 3. Builds the C harness against the xcframework's macOS slice and runs it. Its own 7.1.4 render
-#    of the decoder's output, by the same rule, must match SpatialAudioBridge's after the two
-#    priming frames: bit for bit, but for panned objects within 1e-6, since sin and cos may round
-#    differently in C and Rust; the same with 4096-byte and with random chunks; seeks at 25, 50 and 75% must
-#    restart the input timeline and converge on the continuous decode; the plain stream must be
-#    refused on its first frame, and stay refused.
+#    of the decoder's output, by the same rule, must match SpatialAudioBridge's bit for bit after
+#    the two priming frames, which shows that the standard fold the library removes is the one the
+#    stream states; the same with 4096-byte and with random chunks; seeks at 25, 50 and 75% must
+#    restart the input timeline and converge on the continuous decode; the D4 sample (objects)
+#    and the plain stream must be refused on their first frame, and stay refused.
 # 4. Links a small C program against every other slice, links the macOS framework into a host that
 #    also carries a second Rust library, Objective-C and C++, and compiles and runs a Swift program
 #    through the framework module (`import DTSX`).
@@ -47,22 +48,29 @@ mkdir -p "$SAMPLES" "$REF" "$OUT"
 [ -f "$SAMPLES/fate-master-audio-7.1.dts" ] ||
     curl -fsSL -o "$SAMPLES/fate-master-audio-7.1.dts" https://fate-suite.ffmpeg.org/dts/master_audio_7.1_24bit.dts
 
-# name, SHA-256 of the elementary stream, DTSX_PRESENTATION_* it carries
+# name, SHA-256 of the elementary stream, what it must give: rendered, or refused (objects)
 DTSX_SAMPLES=(
-    "dtsx-object-emulator.dts 718cb0dc98f67dcf6f04778fb64ff8862fc625bb782353a6ff9d828fb05fbd69 0"
-    "dtsx-experience-d4.dts 5e8fc319289ab9ce5a44c7f161feb2fe497babf442185c8c965b34e1990a675c 5"
+    "dtsx-object-emulator.dts 718cb0dc98f67dcf6f04778fb64ff8862fc625bb782353a6ff9d828fb05fbd69 rendered"
+    "dtsx-experience-d4.dts 5e8fc319289ab9ce5a44c7f161feb2fe497babf442185c8c965b34e1990a675c refused"
 )
 present=()
+refused=()
 for spec in "${DTSX_SAMPLES[@]}"; do
-    read -r name sha presentation <<<"$spec"
+    read -r name sha outcome <<<"$spec"
     if [ ! -f "$SAMPLES/$name" ]; then
         echo "==> $name missing from $SAMPLES: its checks are skipped (see README.md, Verify)"
     elif [ "$(shasum -a 256 "$SAMPLES/$name" | cut -d' ' -f1)" != "$sha" ]; then
         echo "ERROR: $SAMPLES/$name is not the validated stream (SHA-256 differs)" >&2
         exit 1
+    elif [ "$outcome" = rendered ]; then
+        present+=("$SAMPLES/$name")
     else
-        present+=("$name $presentation")
+        refused+=("$SAMPLES/$name")
     fi
+done
+for path in ${DTSX_LOCAL_SAMPLES:-}; do
+    [ -f "$path" ] || { echo "ERROR: $path (DTSX_LOCAL_SAMPLES) does not exist" >&2; exit 1; }
+    present+=("$path")
 done
 
 # ---- references from SpatialAudioBridge --------------------------------------------------
@@ -80,9 +88,9 @@ if [ "${#present[@]}" -gt 0 ]; then
         (cd "$ROOT/SpatialAudioBridge/Rust/SpatialAudioCore" &&
             CARGO_TARGET_DIR="$ROOT/SpatialAudioBridge/target" cargo build --release --locked --example render)
     fi
-    for entry in ${present[@]+"${present[@]}"}; do
-        read -r name _ <<<"$entry"
-        [ -s "$REF/${name%.dts}.f32" ] || "$SAB_RENDER" dtsx "$SAMPLES/$name" "$REF/${name%.dts}.f32" 7.1.4 >/dev/null
+    for path in ${present[@]+"${present[@]}"}; do
+        base="$(basename "${path%.dts}")"
+        [ -s "$REF/$base.f32" ] || "$SAB_RENDER" dtsx "$path" "$REF/$base.f32" 7.1.4 >/dev/null
     done
 fi
 
@@ -120,14 +128,13 @@ same_as_reference() {
         failures=$((failures + 1))
     fi
 }
-for entry in ${present[@]+"${present[@]}"}; do
-    read -r name presentation <<<"$entry"
-    base="${name%.dts}"
+for path in ${present[@]+"${present[@]}"}; do
+    base="$(basename "${path%.dts}")"
     run "$base, 4096-byte chunks, render + seeks" \
-        --expect-presentation "$presentation" --seek --render "$OUT/$base.f32" "$SAMPLES/$name"
+        --expect-presentation 0 --seek --render "$OUT/$base.f32" "$path"
     same_as_reference "$base" "$OUT/$base.f32" "$REF/$base.f32" "$LAST_LOG"
     run "$base, random 1..16384-byte chunks, render" \
-        --random-chunks --expect-presentation "$presentation" --render "$OUT/$base-random.f32" "$SAMPLES/$name"
+        --random-chunks --expect-presentation 0 --render "$OUT/$base-random.f32" "$path"
     if cmp -s "$OUT/$base.f32" "$OUT/$base-random.f32"; then
         echo "  identical to the 4096-byte decode"
     else
@@ -135,6 +142,9 @@ for entry in ${present[@]+"${present[@]}"}; do
         failures=$((failures + 1))
     fi
     rm -f "$OUT/$base.f32" "$OUT/$base-random.f32"
+done
+for path in ${refused[@]+"${refused[@]}"}; do
+    run "$(basename "$path") (alternate presentation, objects), refused" --expect-refusal -7 "$path"
 done
 run "FATE master_audio_7.1_24bit.dts (plain DTS-HD MA), refused" \
     --expect-refusal -6 "$SAMPLES/fate-master-audio-7.1.dts"

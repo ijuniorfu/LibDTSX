@@ -6,10 +6,10 @@
  *     --random-chunks       push random chunks of 1..16384 bytes (fixed seed)
  *     --render out.f32      write a 7.1.4 render, interleaved Float32 in the order
  *                           L R C LFE Ls Rs Lb Rb Tfl Tfr Tbl Tbr, made by SpatialAudioBridge's
- *                           DTS:X rule (beds and fixed channels routed to their speaker, objects
- *                           panned by angle over constant-power bed and height rings and ramped
- *                           over the frame when they move), so `cmp` against its `render`
- *                           example output checks the decode, the fold removal and the metadata
+ *                           DTS:X rule (beds and fixed channels routed to their speaker; an
+ *                           object channel fails the render, the library has none), so `cmp`
+ *                           against its `render` example output checks the decode and the fold
+ *                           removal
  *     --expect-refusal S    the first pull must return status S; checks that push() and pull()
  *                           keep returning it and that reset() keeps it
  *     --expect-presentation P   every block must carry DTSX_PRESENTATION_* P
@@ -18,10 +18,8 @@
  *                           must restart at 0 and the output must match the continuous decode
  *
  *   harness --compare a.f32 b.f32 FRAME
- *                           compares two 7.1.4 renders from input frame FRAME on: bit-identical, or
- *                           the largest difference, which must stay below 1e-6 (-120 dBFS). The
- *                           panned object gains go through sin and cos, which Apple's C and Rust
- *                           toolchains may round a unit in the last place apart.
+ *                           compares two 7.1.4 renders from input frame FRAME on: they must be
+ *                           bit-identical.
  *
  * Exit status 0 when every requested check passes. Compile with -ffp-contract=off so the render
  * rounds as the Rust reference does.
@@ -36,7 +34,6 @@
 #include <string.h>
 
 #define OUT_CHANNELS 12
-#define HALF_PI 1.57079632679489661923f
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                                          \
@@ -122,66 +119,8 @@ static int output_index(uint8_t speaker) {
 }
 
 typedef struct {
-    int n;
-    const int *channel;
-    const float *azimuth;
-} Ring;
-
-static const int bed_channels[7] = {6, 4, 0, 2, 1, 5, 7};
-static const float bed_azimuths[7] = {-145, -90, -30, 0, 30, 90, 145};
-static const int height_channels[4] = {10, 8, 9, 11};
-static const float height_azimuths[4] = {-135, -45, 45, 135};
-static const Ring bed_ring = {7, bed_channels, bed_azimuths};
-static const Ring height_ring = {4, height_channels, height_azimuths};
-
-static float rem_euclid(float a, float b) {
-    float r = fmodf(a, b);
-    return r < 0 ? r + fabsf(b) : r;
-}
-
-static void angular(const Ring *ring, float azimuth, float *g) {
-    float angle = rem_euclid(azimuth + 180.0f, 360.0f) - 180.0f;
-    int next = 0;
-    while (next < ring->n && ring->azimuth[next] <= angle) next++;
-    int a = (next + ring->n - 1) % ring->n, b = next % ring->n;
-    float span = rem_euclid(ring->azimuth[b] - ring->azimuth[a], 360.0f);
-    float offset = rem_euclid(angle - ring->azimuth[a], 360.0f);
-    float t = offset / span;
-    t = t < 0 ? 0 : (t > 1 ? 1 : t);
-    memset(g, 0, sizeof(float) * OUT_CHANNELS);
-    g[ring->channel[a]] = fmaxf(cosf(t * HALF_PI), 0.0f);
-    g[ring->channel[b]] = sinf(t * HALF_PI);
-}
-
-static void polar(float azimuth, float elevation, float distance, float *gains) {
-    float bed[OUT_CHANNELS], height[OUT_CHANNELS], centre[OUT_CHANNELS] = {0};
-    elevation = elevation < 0 ? 0 : (elevation > 90 ? 90 : elevation);
-    angular(&bed_ring, azimuth, bed);
-    angular(&height_ring, azimuth, height);
-    float overhead = fmaxf((elevation - 45.0f) / 45.0f, 0.0f);
-    for (int i = 0; i < height_ring.n; i++) {
-        int c = height_ring.channel[i];
-        height[c] = sqrtf(overhead / (float)height_ring.n + (1.0f - overhead) * (height[c] * height[c]));
-    }
-    float vertical = fminf(elevation / 45.0f, 1.0f) * HALF_PI;
-    float height_gain = sinf(vertical), bed_gain = fmaxf(cosf(vertical), 0.0f);
-    for (int i = 0; i < bed_ring.n; i++) centre[bed_ring.channel[i]] = sqrtf(1.0f / (float)bed_ring.n);
-    float radius = distance < 0 ? 0 : (distance > 1 ? 1 : distance);
-    for (int i = 0; i < OUT_CHANNELS; i++) {
-        float directional = bed[i] * bed_gain + height[i] * height_gain;
-        gains[i] = sqrtf(radius * (directional * directional) + (1.0f - radius) * (centre[i] * centre[i]));
-    }
-}
-
-typedef struct {
-    float current[OUT_CHANNELS], step[OUT_CHANNELS], target[OUT_CHANNELS];
-    uint32_t remaining;
-    bool primed;
-} Route;
-
-typedef struct {
     FILE *out;
-    Route routes[DTSX_MAX_CHANNELS];
+    int routes[DTSX_MAX_CHANNELS]; /* output index of each channel */
     float *buffer;
     bool unsupported;
     uint64_t written; /* frames written, on the input timeline */
@@ -197,47 +136,15 @@ static void render_block(Renderer *r, const DTSXBlock *b) {
         r->written += n;
     }
     r->written += b->frame_count;
-    const DTSXElement *elements = b->metadata ? b->metadata->elements : NULL;
     for (uint32_t c = 0; c < b->channel_count; c++) {
-        Route *route = &r->routes[c];
-        float target[OUT_CHANNELS] = {0};
-        if (b->speakers[c] == DTSX_SPEAKER_OBJECT && elements) {
-            polar(elements[c].azimuth, elements[c].elevation, elements[c].distance, target);
-            float *previous = route->primed ? route->target : target;
-            memcpy(route->current, previous, sizeof target);
-            route->remaining = 0;
-            if (memcmp(previous, target, sizeof target) != 0) {
-                for (int i = 0; i < OUT_CHANNELS; i++)
-                    route->step[i] = (target[i] - route->current[i]) / (float)b->frame_count;
-                route->remaining = b->frame_count;
-            }
-            memcpy(route->target, target, sizeof target);
-            route->primed = true;
-        } else {
-            int index = output_index(b->speakers[c]);
-            if (index < 0) {
-                r->unsupported = true;
-                continue;
-            }
-            target[index] = 1.0f;
-            memcpy(route->current, target, sizeof target);
-            memcpy(route->target, target, sizeof target);
-            route->remaining = 0;
-        }
+        r->routes[c] = output_index(b->speakers[c]);
+        if (r->routes[c] < 0) r->unsupported = true;
     }
     float *out = r->buffer;
     memset(out, 0, sizeof(float) * OUT_CHANNELS * b->frame_count);
-    for (uint32_t s = 0; s < b->frame_count; s++) {
-        for (uint32_t c = 0; c < b->channel_count; c++) {
-            Route *route = &r->routes[c];
-            if (route->remaining > 0) {
-                for (int i = 0; i < OUT_CHANNELS; i++) route->current[i] += route->step[i];
-                if (--route->remaining == 0) memcpy(route->current, route->target, sizeof route->target);
-            }
-            float x = b->channels[c][s];
-            for (int i = 0; i < OUT_CHANNELS; i++) out[s * OUT_CHANNELS + i] += x * route->current[i];
-        }
-    }
+    for (uint32_t s = 0; s < b->frame_count; s++)
+        for (uint32_t c = 0; c < b->channel_count; c++)
+            if (r->routes[c] >= 0) out[s * OUT_CHANNELS + r->routes[c]] += b->channels[c][s];
     fwrite(out, sizeof(float), OUT_CHANNELS * b->frame_count, r->out);
 }
 
@@ -393,7 +300,7 @@ static int compare(const char *a_path, const char *b_path, size_t from_frame) {
     }
     printf("  identical from input frame %zu but for %zu of %zu samples, by at most %.3g\n", from_frame,
            differing, n - skip, worst);
-    return worst <= 1e-6f ? 0 : 1;
+    return 1;
 }
 
 int main(int argc, char **argv) {

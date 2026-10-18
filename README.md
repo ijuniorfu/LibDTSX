@@ -1,22 +1,21 @@
 # LibDTSX
 
 A C-callable decoder for DTS:X on Apple platforms. It decodes the lossless DTS-HD Master Audio
-stream DTS:X is carried on and returns everything a renderer needs to place it in a room: the
-compatible bed with the encoder's spatial folds removed, the fixed height channels, and the
-objects of the alternate presentations with their positions and timed updates. It ships as
+stream DTS:X is carried on and returns its standard presentation ready to play on 7.1.4 speakers:
+the compatible 7.1 bed with the four height channels removed from it, and the heights on their
+own channels. The alternate presentations, which carry objects, are refused. It ships as
 `DTSX.xcframework`, a dynamic framework per platform, with a Swift package, for iOS, tvOS, macOS
 and visionOS. The built library is LGPL-3.0-or-later, see [License](#license).
 
 Its API has the shape of [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)'s, so a
 host that renders TrueHD Atmos objects into a speaker bed can render DTS:X with the same code:
-planar float channels, a speaker code or "object" per channel, and metadata updates with
-positions in the room coordinates Dolby Atmos uses.
+planar float channels, a speaker code per channel, and metadata with each channel's position in
+the room coordinates Dolby Atmos uses.
 
 The decoding is the [`dca`](https://github.com/harletty/harletty-bridge/tree/a717bae441b116485f0254603dc20a6ede65d8c6/dca)
 crate from harletty-bridge, a port of FFmpeg's `dca` decoder, pinned to an exact commit. This repository adds the C API,
-the framing and input timeline, the DTS:X verdict, the spatial reconstruction (which follows
-[SpatialAudioBridge](https://github.com/kristofferR/SpatialAudioBridge)'s DTS:X decoder), the
-conversion of DTS:X object angles into room coordinates, and the Apple packaging.
+the framing and input timeline, the DTS:X verdict, the removal of the heights from the bed, and the
+Apple packaging.
 
 ## Use
 
@@ -37,9 +36,9 @@ dtsx_decoder_push(decoder, bytes, count, Int64.min)
 var block = DTSXBlock()
 var status = dtsx_decoder_pull(decoder, &block)
 while status == DTSX_OK {
-    // block.channels: planar float32, one plane per channel (bed, object or fixed height)
-    // block.speakers: each channel's speaker code, DTSX_SPEAKER_OBJECT for objects
-    // block.metadata: positions, and updates starting in this block
+    // block.channels: planar float32, one plane per channel: the 7.1 bed, then the four heights
+    // block.speakers: each channel's speaker code
+    // block.metadata: each channel's nominal position
     // block.input_frame_offset: input frames before this block since the last reset
     status = dtsx_decoder_pull(decoder, &block)
 }
@@ -52,28 +51,25 @@ dtsx_decoder_reset(decoder)
 ```
 
 [`include/dtsx.h`](include/dtsx.h) is the reference: ownership, threading, the refusal contract,
-coordinates, the input timeline and every metadata field are documented there.
+the input timeline and every metadata field are documented there.
 
 ## What comes out
 
-| Presentation | Channels | In content |
-|---|---|---|
-| 7.1.4 (standard) | 7.1 bed, then Tfl, Tfr, Tbl, Tbr | Every frame of every DTS:X film in a [library census](https://github.com/kristofferR/SpatialAudioBridge/blob/main/docs/validation.md#library-census) |
-| 7.1.4+1, +2, +4, +5 | 7.1 bed, then 1, 2, 4 or 5 objects, then the four heights | +1 in classic and IMAX-labelled streams of `dca`'s corpus; +2 in *Independence Day* (FFmpeg: "DTS:X IMAX"), two static objects at ±34.5°, 12° up; +5 in Trinnov's *Experience* trailer |
-| 7.1.4+3 | 7.1 bed, one object as three components at C, L and R, then the four heights | `dca`'s IMAX test vector |
-| 5.1+1 | 5.1 bed, then one object | |
+The standard presentation: the 7.1 bed, then Tfl, Tfr, Tbl and Tbr. It is the one presentation of
+DTS:X content at large: every frame of every DTS:X film in a
+[library census](https://github.com/kristofferR/SpatialAudioBridge/blob/main/docs/validation.md#library-census)
+carries it, and so did every frame of twelve DTS:X tracks measured here (eight *Harry Potter*
+films, two *Shrek* films in two languages, *Mary and the Witch's Flower*).
 
-The alternate presentations are classified by `dca` from a corpus and are experimental there and
-here (`DTSXStreamInfo.experimental`).
-
-- **The bed is cleaned.** The encoder folds every height and object into the compatible 7.1 bed it
-  also transmits. The library subtracts those contributions, at the gains the frame states or that
-  `dca`'s fold renderer recomputes for objects panned into the bed from their position, so the bed,
-  the heights and the objects can be rendered side by side without playing anything twice.
-- **Objects are placed in the room.** DTS:X states object positions as angles around the listener.
-  The library projects the reference sphere onto the room's boundary, so a renderer panning by
-  room position reproduces panning by angle between neighbouring speakers: the header's
-  COORDINATES section gives the mapping. The angles are reported as transmitted too.
+- **The bed is cleaned with the standard's own fold.** The encoder mixes each height into the bed
+  speaker under it at -3 dB (Tfl into L, Tfr into R, Tbl into Lb, Tbr into Rb), so that a 7.1
+  decoder plays the whole soundtrack. The library subtracts exactly that, so the bed and the
+  heights can be played side by side without playing anything twice. It does not read the
+  stream's private metadata: across the twelve tracks above, every frame stated this same fold,
+  and the result is bit-identical to subtracting what the stream states.
+- **Objects are not rendered.** The alternate presentations (7.1.4 plus one to five objects in some
+  IMAX-labelled streams and trailers, 5.1 plus one object) are refused with `DTSX_ERR_UNSUPPORTED`
+  on their first frame, so a host plays them as the plain 7.1 their compatible bed is.
 - **Refusals are cheap.** The first frame decides whether the stream is DTS:X this library renders
   (`DTSX_ERR_NOT_DTSX`, `DTSX_ERR_UNSUPPORTED`). FFmpeg names only two of the extension's markers,
   so it labels some DTS:X tracks plain "DTS-HD MA"; a host can offer every DTS-HD MA track and fall
@@ -84,9 +80,9 @@ here (`DTSXStreamInfo.experimental`).
   produce no block and count on the input timeline. Measured over 120 seeks into five DTS:X
   streams, the first block after a seek then differs from a continuous decode by at most −33 dBFS,
   and the output is bit-identical again within about ten frames.
-- **Nothing fails mid-stream.** A frame whose extension cannot be applied (none, damaged
-  metadata, a fold the stream does not state) is returned with `DTSX_BLOCK_BED_AS_AUTHORED`: its
-  bed as transmitted and silent heights and objects. None of the films tested had one.
+- **Nothing fails mid-stream.** A frame whose extension cannot be applied (none, one that does
+  not decode, a frame in another presentation) is returned with `DTSX_BLOCK_BED_AS_AUTHORED`: its
+  bed as transmitted and silent heights. None of the films tested had one.
 
 ## Build
 
@@ -110,12 +106,13 @@ harness/verify.sh
 
 It downloads FFmpeg's FATE `master_audio_7.1_24bit.dts` (plain DTS-HD MA), clones SpatialAudioBridge
 at a pinned commit and builds its renderer, then checks the macOS slice: a 7.1.4 render of the
-decoder's output, made by SpatialAudioBridge's rule, must match SpatialAudioBridge's own after the
-priming frames, in any chunking. It is bit-identical for the standard presentation; panned objects
-go through sin and cos, which Apple's C and Rust toolchains round up to a unit in the last place
-apart (6e-8 on the D4 sample), so they must agree within 1e-6. Seeks must restart the input
-timeline and converge, and the plain stream must be refused. It also links every other slice and
-imports the module from Swift. Working files go to `target/work/`.
+decoder's output must be bit-identical to SpatialAudioBridge's own after the priming frames, in
+any chunking. SpatialAudioBridge removes the fold each frame states, so this also shows that the
+standard fold the library removes is the stated one. Seeks must restart the input timeline and
+converge, and the D4 sample (objects) and the plain stream must be refused. It also links every
+other slice and imports the module from Swift. Working files go to `target/work/`.
+`DTSX_LOCAL_SAMPLES` may name more streams in the standard presentation, such as excerpts of films,
+which are checked the same way.
 
 The DTS:X samples have no stable public URL, so put them in `target/work/samples/` yourself, as
 elementary streams (`ffmpeg -i <file> -map 0:a:0 -c copy -f dts <name>`):
@@ -128,20 +125,16 @@ elementary streams (`ffmpeg -i <file> -map 0:a:0 -c copy -f dts <name>`):
 `cargo test --release` covers what the harness does not reach (arguments, the refusal contract,
 damage between frames, a frame with a damaged extension) and reads the Object Emulator from
 `target/work/samples/` or `$DTSX_SAMPLE`. `cargo run --release --example dtsx_info -- <stream>`
-reports a stream's presentation, channels, levels, object positions and decode speed.
+reports a stream's presentation, channels, levels and decode speed.
 
-Beyond the samples, the harness rule matched SpatialAudioBridge bit for bit (on Linux, where C and
-Rust share one libm) on three 60-second windows each of *8 Mile* and *The Bourne Identity* (7.1.4)
-and *Independence Day* (7.1.4+2), and on both samples, and
-the decoder refused three windows of *Arrival* (plain DTS-HD MA) on their first frame. Decoding
-runs at about 200× real time for 7.1.4 and 150× for 7.1.4+5 on one core of a desktop x86-64 CPU.
+Decoding runs at about 70× real time on one core of an M1.
 
 ## Limitations
 
 - Only DTS:X on lossless DTS-HD Master Audio is rendered; DTS:X on a lossy carrier is refused.
-- The alternate presentations rest on `dca`'s corpus evidence, and no listening sign-off exists
-  for them yet.
-- The object placement is an approximation of DTS:X rendering, not DTS's reference renderer.
+- Only the standard presentation is rendered; streams with objects play as 7.1.
+- A stream whose encoder folded its heights at another gain would keep part of each height in the
+  bed. None of the content measured does.
 
 ## License
 
