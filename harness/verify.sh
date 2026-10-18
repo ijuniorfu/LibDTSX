@@ -55,10 +55,12 @@ DTSX_SAMPLES=(
 )
 present=()
 refused=()
+missing=0
 for spec in "${DTSX_SAMPLES[@]}"; do
     read -r name sha outcome <<<"$spec"
     if [ ! -f "$SAMPLES/$name" ]; then
         echo "==> $name missing from $SAMPLES: its checks are skipped (see README.md, Verify)"
+        missing=$((missing + 1))
     elif [ "$(shasum -a 256 "$SAMPLES/$name" | cut -d' ' -f1)" != "$sha" ]; then
         echo "ERROR: $SAMPLES/$name is not the validated stream (SHA-256 differs)" >&2
         exit 1
@@ -281,7 +283,7 @@ print("Swift: \(blocks) blocks, \(name), \(info.channel_count) ch (\(objects) ob
 exit(blocks > 0 && status == DTSX_NEED_MORE_DATA ? 0 : 1)
 EOF
 swift_sample=""
-for entry in ${present[@]+"${present[@]}"}; do read -r name _ <<<"$entry"; swift_sample="$SAMPLES/$name"; done
+for path in ${present[@]+"${present[@]}"}; do swift_sample="$path"; done
 if xcrun swiftc -O -F "$MAC" -Xlinker -rpath -Xlinker "$MAC" "$OUT/swift_check.swift" \
     -o "$OUT/swift_check" 2>"$OUT/swift.log" &&
     "$OUT/swift_check" "$SAMPLES/fate-master-audio-7.1.dts" refused 2>/dev/null &&
@@ -294,7 +296,7 @@ else
 fi
 
 echo
-if [ "${#present[@]}" -lt "${#DTSX_SAMPLES[@]}" ]; then
-    echo "NOTE: $((${#DTSX_SAMPLES[@]} - ${#present[@]})) DTS:X sample(s) missing; their checks did not run"
+if [ "$missing" -gt 0 ]; then
+    echo "NOTE: $missing DTS:X sample(s) missing; their checks did not run"
 fi
 if [ "$failures" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "$failures CHECK(S) FAILED"; exit 1; fi

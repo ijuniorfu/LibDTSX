@@ -20,7 +20,7 @@ Apple packaging.
 ## Use
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMajor(from: "2.0.0")),
+.package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMajor(from: "3.0.0")),
 // target dependency:
 .product(name: "DTSX", package: "LibDTSX"),
 ```
