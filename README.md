@@ -1,5 +1,12 @@
 # LibDTSX
 
+> **Superseded.** AetherEngine 7.44.0 no longer uses LibDTSX: DTS:X decodes through FFmpeg's own `dca`
+> decoder, which [FFmpegBuild 3.9.0](https://github.com/superuser404notfound/FFmpegBuild/releases/tag/3.9.0)
+> patches to read the standard presentation's height channels (decoder option `x_heights`). That route
+> is plain FFmpeg under LGPL-2.1-or-later, while this library is LGPL-3.0-or-later (see
+> [License](#license)) and cannot ship in an App Store app without an exception (#2). The repository
+> stays up for reference and is no longer maintained.
+
 A C-callable decoder for DTS:X on Apple platforms. It decodes the lossless DTS-HD Master Audio
 stream DTS:X is carried on and returns its standard presentation ready to play on 7.1.4 speakers:
 the compatible 7.1 bed with the four height channels removed from it, and the heights on their
